@@ -1,5 +1,6 @@
 from config import app_config
 from fastapi import FastAPI, Request, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 
 import uvicorn
 from router.public_router import router as public_router
@@ -20,6 +21,14 @@ app = FastAPI(
     redoc_url="/redoc",
 )
 
+# CORS configuration
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 app.include_router(public_router)
 app.include_router(music_router)
