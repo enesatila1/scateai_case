@@ -1,8 +1,8 @@
 import logging
 from fastapi import APIRouter, File, UploadFile
 from fastapi.responses import FileResponse
-from config import GenerateSongRequest, GenerateSongResponse, GenerateCoverResponse, BillingResponse
-from services.mureka_service import ReplicateService
+from ..config import GenerateSongRequest, GenerateSongResponse, GenerateCoverResponse, BillingResponse
+from ..services.mureka_service import ReplicateService
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/music", tags=["MUSIC"])

@@ -1,10 +1,10 @@
-from config import app_config
+from .config import app_config
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 import uvicorn
-from router.public_router import router as public_router
-from router.music_router import router as music_router
+from .router.public_router import router as public_router
+from .router.music_router import router as music_router
 
 
 app = FastAPI(

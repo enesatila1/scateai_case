@@ -3,7 +3,7 @@ import replicate
 import tempfile
 import os
 import io
-from config import app_config, GenerateSongRequest, BillingResponse
+from ..config import app_config, GenerateSongRequest, BillingResponse
 from fastapi.responses import FileResponse, JSONResponse
 from pydub import AudioSegment
 import requests as req
