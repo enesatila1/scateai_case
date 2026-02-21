@@ -1,103 +1,221 @@
-import requests
-from typing import Optional, Dict, Any
-from config import app_config
+import logging
+import replicate
+import tempfile
+import os
+from config import app_config, GenerateSongRequest, BillingResponse
+from fastapi.responses import FileResponse, JSONResponse
 
-class MurekaService:
-    """Service for interacting with Mureka API"""
+logger = logging.getLogger(__name__)
+
+
+class ReplicateService:
+    """Service for interacting with Replicate API for music generation"""
 
     def __init__(self):
-        self.base_url = app_config.mureka_api_url
-        self.api_key = app_config.api_key
-        self.headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json"
-        }
+        # Set API token for replicate
+        os.environ["REPLICATE_API_TOKEN"] = app_config.replicate_api_key
+        self.client = replicate.Client(api_token=app_config.replicate_api_key)
+        self.song_model = app_config.song_generation_model
+        self.voice_model = app_config.voice_cloning_model
 
-    def generate_song(
-        self,
-        prompt: str,
-        lyrics: Optional[str] = None,
-        model: str = "auto"
-    ) -> Dict[str, Any]:
-        """
-        Generate an original song from prompt and optional lyrics
+    async def generate_song(self, request: GenerateSongRequest):
+        """Generate an original song from prompt and optional lyrics using ElevenLabs Music model"""
+        try:
+            logger.info(f"Generating song with prompt: {request.prompt}, lyrics: {request.lyrics}")
 
-        Args:
-            prompt: Text describing mood, genre, theme, and style
-            lyrics: Optional lyrics for the song
-            model: Model to use (default: auto)
+            # Combine prompt and lyrics for better music generation
+            full_prompt = request.prompt
+            if request.lyrics:
+                # Include vocals in the prompt and add lyrics
+                full_prompt = f"{request.prompt} with vocals and singing. Lyrics: {request.lyrics}"
+            else:
+                # If no lyrics provided, still request vocals
+                full_prompt = f"{request.prompt} with vocals and singing"
 
-        Returns:
-            API response with generated song details
-        """
-        payload = {
-            "prompt": prompt,
-            "model": model
-        }
+            # Prepare input for elevenlabs/music model
+            input_data = {
+                "prompt": full_prompt,
+                "music_length_ms": 30000,  # 90 seconds (1.5 minutes)
+                "output_format": "mp3_high_quality",  # High quality MP3
+                "force_instrumental": False  # Allow vocals in the output
+            }
 
-        if lyrics:
-            payload["lyrics"] = lyrics
+            # Call Replicate API
+            output = self.client.run(
+                self.song_model,
+                input=input_data
+            )
+
+            logger.info("Song generated successfully")
+
+            # Handle different output types from Replicate
+            audio_url = None
+
+            if isinstance(output, str):
+                # If it's a URL string
+                audio_url = output
+            elif hasattr(output, 'url'):
+                # If it's a FileOutput object with url attribute
+                audio_url = str(output.url)
+            elif isinstance(output, dict):
+                # If it's a dict, try to find the audio URL
+                if "audio" in output:
+                    audio_url = output["audio"]
+                elif "url" in output:
+                    audio_url = output["url"]
+
+            if audio_url:
+                return await self._download_and_return_file(audio_url, "generated_song.mp3")
+            else:
+                logger.error(f"Could not extract audio URL from output: {output}")
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": "Failed to extract audio from generation"}
+                )
+
+        except Exception as e:
+            logger.error(f"Error generating song: {str(e)}")
+            return JSONResponse(
+                status_code=400,
+                content={"error": str(e)}
+            )
+
+    async def generate_cover(self, song_file, voice_sample):
+        """Generate a cover using voice cloning with realistic-voice-cloning model"""
+        try:
+            # Read file contents
+            song_content = await song_file.read()
+            voice_content = await voice_sample.read()
+
+            logger.info(f"Generating cover: song={song_file.filename}, voice={voice_sample.filename}")
+
+            # Save files temporarily
+            with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(song_file.filename)[1]) as song_tmp:
+                song_tmp.write(song_content)
+                song_path = song_tmp.name
+
+            with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(voice_sample.filename)[1]) as voice_tmp:
+                voice_tmp.write(voice_content)
+                voice_path = voice_tmp.name
+
+            try:
+                # Call Replicate API for voice cloning
+                output = self.client.run(
+                    self.voice_model,
+                    input={
+                        "song_input": open(song_path, "rb"),
+                        "rvc_model": "custom",  # Using custom voice sample
+                        "pitch_change": 0,
+                        "protect": 0.5
+                    }
+                )
+
+                logger.info("Cover generated successfully")
+
+                # Handle different output types from Replicate
+                audio_url = None
+
+                if isinstance(output, str):
+                    # If it's a URL string
+                    audio_url = output
+                elif hasattr(output, 'url'):
+                    # If it's a FileOutput object with url attribute
+                    audio_url = str(output.url)
+                elif isinstance(output, dict):
+                    # If it's a dict, try to find the audio URL
+                    if "audio" in output:
+                        audio_url = output["audio"]
+                    elif "url" in output:
+                        audio_url = output["url"]
+
+                if audio_url:
+                    return await self._download_and_return_file(audio_url, "generated_cover.mp3")
+                else:
+                    logger.error(f"Could not extract audio URL from output: {output}")
+                    return JSONResponse(
+                        status_code=400,
+                        content={"error": "Failed to extract audio from generation"}
+                    )
+
+            finally:
+                # Clean up temporary files
+                os.unlink(song_path)
+                os.unlink(voice_path)
+
+        except Exception as e:
+            logger.error(f"Error generating cover: {str(e)}")
+            return JSONResponse(
+                status_code=400,
+                content={"error": str(e)}
+            )
+
+    async def get_billing(self) -> BillingResponse:
+        """Get account information (Replicate doesn't have a billing API, return placeholder)"""
+        try:
+            logger.info("Fetching account information")
+
+            return BillingResponse(
+                status="success",
+                data={
+                    "provider": "Replicate",
+                    "billing_model": "Pay-per-use",
+                    "estimated_cost_per_song": "$0.03-0.08",
+                    "estimated_cost_per_cover": "$0.01-0.03",
+                    "note": "Visit https://replicate.com/account to manage billing"
+                }
+            )
+
+        except Exception as e:
+            logger.error(f"Error fetching billing: {str(e)}")
+            return BillingResponse(
+                status="error",
+                error=str(e)
+            )
+
+    async def _download_and_return_file(self, url: str, filename: str):
+        """Download file from URL and return as FileResponse"""
+        import requests
 
         try:
-            response = requests.post(
-                f"{self.base_url}/song/generate",
-                headers=self.headers,
-                json=payload
-            )
+            response = requests.get(url, stream=True)
             response.raise_for_status()
-            return response.json()
-        except requests.exceptions.RequestException as e:
-            return {"error": str(e), "status_code": response.status_code}
 
-    def generate_cover_with_voice(
-        self,
-        song_url: str,
-        voice_sample_url: str,
-        voice_id: Optional[str] = None
-    ) -> Dict[str, Any]:
-        """
-        Generate a cover of a song using a specific voice identity
+            # Detect the actual content type from response headers
+            content_type = response.headers.get('content-type', 'audio/wav')
 
-        Args:
-            song_url: URL or reference to the song to cover
-            voice_sample_url: URL to the voice sample to use
-            voice_id: Optional pre-registered voice ID
+            # Determine file extension based on content type
+            if 'audio/mpeg' in content_type or 'mp3' in content_type:
+                file_ext = '.mp3'
+                media_type = 'audio/mpeg'
+            elif 'audio/wav' in content_type or 'wav' in content_type:
+                file_ext = '.wav'
+                media_type = 'audio/wav'
+            elif 'audio/ogg' in content_type or 'ogg' in content_type:
+                file_ext = '.ogg'
+                media_type = 'audio/ogg'
+            else:
+                # Default to WAV
+                file_ext = '.wav'
+                media_type = 'audio/wav'
 
-        Returns:
-            API response with generated cover details
-        """
-        payload = {
-            "reference_song": song_url,
-            "voice_sample": voice_sample_url
-        }
+            # Save to temporary file with correct extension
+            with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as tmp:
+                tmp.write(response.content)
+                tmp_path = tmp.name
 
-        if voice_id:
-            payload["voice_id"] = voice_id
+            # Create filename with correct extension
+            base_name = os.path.splitext(filename)[0]
+            output_filename = f"{base_name}{file_ext}"
 
-        try:
-            response = requests.post(
-                f"{self.base_url}/song/generate",
-                headers=self.headers,
-                json=payload
+            return FileResponse(
+                path=tmp_path,
+                media_type=media_type,
+                filename=output_filename
             )
-            response.raise_for_status()
-            return response.json()
-        except requests.exceptions.RequestException as e:
-            return {"error": str(e), "status_code": response.status_code}
 
-    def get_account_billing(self) -> Dict[str, Any]:
-        """
-        Get account billing information and quota usage
-
-        Returns:
-            API response with billing and quota details
-        """
-        try:
-            response = requests.get(
-                f"{self.base_url}/account/billing",
-                headers=self.headers
+        except Exception as e:
+            logger.error(f"Error downloading file: {str(e)}")
+            return JSONResponse(
+                status_code=400,
+                content={"error": f"Failed to download audio: {str(e)}"}
             )
-            response.raise_for_status()
-            return response.json()
-        except requests.exceptions.RequestException as e:
-            return {"error": str(e), "status_code": response.status_code}

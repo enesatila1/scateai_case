@@ -1,97 +1,36 @@
 import logging
-from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
-from typing import Optional
-from services.mureka_service import MurekaService
+from fastapi import APIRouter, File, UploadFile
+from fastapi.responses import FileResponse
+from config import GenerateSongRequest, GenerateSongResponse, GenerateCoverResponse, BillingResponse
+from services.mureka_service import ReplicateService
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/music", tags=["MUSIC"])
-mureka_service = MurekaService()
+service = ReplicateService()
 
-class GenerateSongRequest(BaseModel):
-    prompt: str
-    lyrics: Optional[str] = None
-    model: str = "auto"
-
-class GenerateCoverRequest(BaseModel):
-    song_url: str
-    voice_sample_url: str
-    voice_id: Optional[str] = None
 
 @router.post("/generate-song")
-async def generate_original_song(request: GenerateSongRequest):
+async def generate_song(request: GenerateSongRequest):
+    """Generate an original song from prompt and optional lyrics
+
+    Returns: Audio file (MP3)
     """
-    Task 1: Generate an original song from text prompt and optional lyrics
+    return await service.generate_song(request)
 
-    Inputs:
-    - prompt: Text describing mood, genre, theme, style (e.g., "upbeat pop, energetic, female vocal")
-    - lyrics: Optional lyrics for the song
-
-    Outputs:
-    - Audio file (instrumental or with AI-generated vocals)
-    - Metadata about the generated song
-    """
-    logger.info(f"Generating song with prompt: {request.prompt}")
-
-    result = mureka_service.generate_song(
-        prompt=request.prompt,
-        lyrics=request.lyrics,
-        model=request.model
-    )
-
-    if "error" in result:
-        logger.error(f"Error generating song: {result}")
-        raise HTTPException(status_code=400, detail=result.get("error"))
-
-    logger.info("Song generated successfully")
-    return result
 
 @router.post("/generate-cover")
-async def generate_cover_with_voice(request: GenerateCoverRequest):
+async def generate_cover(
+    song_file: UploadFile = File(..., description="Audio file of the song to cover (MP3, WAV)"),
+    voice_sample: UploadFile = File(..., description="Voice sample for cloning (10 seconds minimum)")
+):
+    """Generate a cover using voice cloning from uploaded files
+
+    Returns: Audio file with cloned voice (MP3)
     """
-    Task 2: Generate a cover of a song using a specific voice identity
+    return await service.generate_cover(song_file, voice_sample)
 
-    Inputs:
-    - song_url: Reference to the song to cover
-    - voice_sample_url: URL to voice sample for voice cloning
-    - voice_id: Optional pre-registered voice ID
 
-    Outputs:
-    - Vocal performance using the uploaded/cloned voice
-    - Preserves melody and timing
-    - Similar to source voice
-    """
-    logger.info(f"Generating cover for song: {request.song_url}")
-
-    result = mureka_service.generate_cover_with_voice(
-        song_url=request.song_url,
-        voice_sample_url=request.voice_sample_url,
-        voice_id=request.voice_id
-    )
-
-    if "error" in result:
-        logger.error(f"Error generating cover: {result}")
-        raise HTTPException(status_code=400, detail=result.get("error"))
-
-    logger.info("Cover generated successfully")
-    return result
-
-@router.get("/billing")
-async def get_billing_info():
-    """
-    Get current account billing info and quota usage
-
-    Returns:
-    - Current credit balance
-    - Usage information
-    - Plan details
-    """
-    logger.info("Fetching billing information")
-
-    result = mureka_service.get_account_billing()
-
-    if "error" in result:
-        logger.error(f"Error fetching billing: {result}")
-        raise HTTPException(status_code=400, detail=result.get("error"))
-
-    return result
+@router.get("/billing", response_model=BillingResponse)
+async def get_billing():
+    """Get account billing info and quota usage"""
+    return await service.get_billing()
