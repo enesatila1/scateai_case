@@ -1,0 +1,23 @@
+{
+  "version": 2,
+  "buildCommand": "pip install -r requirements.txt",
+  "env": {
+    "REPLICATE_API_KEY": "@replicate_api_key"
+  },
+  "builds": [
+    {
+      "src": "src/app.py",
+      "use": "@vercel/python",
+      "config": {
+        "maxLambdaSize": "3000mb",
+        "runtime": "python3.12"
+      }
+    }
+  ],
+  "routes": [
+    {
+      "src": "/(.*)",
+      "dest": "src/app.py"
+    }
+  ]
+}
