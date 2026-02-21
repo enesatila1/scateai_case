@@ -3,7 +3,11 @@ import replicate
 import tempfile
 import os
 import io
-from ..config import app_config, GenerateSongRequest, BillingResponse
+import uuid
+import threading
+import queue
+import gc
+from ..config import app_config, GenerateSongRequest, BillingResponse, JobStatusResponse
 from fastapi.responses import FileResponse, JSONResponse
 from pydub import AudioSegment
 import requests as req
@@ -23,6 +27,254 @@ class ReplicateService:
         self.client = replicate.Client(api_token=app_config.replicate_api_key)
         self.song_model = app_config.song_generation_model
         self.voice_model = app_config.voice_cloning_model
+
+        # Job queue system
+        self.jobs = {}  # UUID → {status, progress, result, error}
+        self.job_queue = queue.Queue()
+        self.worker_running = True
+
+        # Start background worker thread
+        self.worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
+        self.worker_thread.start()
+
+    async def submit_cover_job(self, song_file, voice_sample):
+        """Submit a cover generation job to the queue"""
+        job_id = str(uuid.uuid4())
+
+        # Read files
+        song_content = await song_file.read()
+        voice_content = await voice_sample.read()
+
+        # Validate file sizes (100MB limit per file)
+        MAX_FILE_SIZE = 100 * 1024 * 1024  # 100MB
+        if len(song_content) > MAX_FILE_SIZE:
+            return JSONResponse(
+                status_code=400,
+                content={"error": f"Song file too large. Max {MAX_FILE_SIZE / 1024 / 1024:.0f}MB"}
+            )
+        if len(voice_content) > MAX_FILE_SIZE:
+            return JSONResponse(
+                status_code=400,
+                content={"error": f"Voice file too large. Max {MAX_FILE_SIZE / 1024 / 1024:.0f}MB"}
+            )
+
+        # Initialize job
+        self.jobs[job_id] = {
+            "status": "pending",
+            "progress": "Queued for processing",
+            "result": None,
+            "error": None,
+            "song_filename": song_file.filename,
+            "voice_filename": voice_sample.filename,
+            "song_content": song_content,
+            "voice_content": voice_content
+        }
+
+        # Add to queue
+        self.job_queue.put(job_id)
+        logger.info(f"Cover job {job_id} submitted")
+
+        return job_id
+
+    def get_job_status(self, job_id: str):
+        """Get job status"""
+        if job_id not in self.jobs:
+            return None
+
+        job = self.jobs[job_id]
+        return JobStatusResponse(
+            job_id=job_id,
+            status=job["status"],
+            progress=job.get("progress"),
+            error=job.get("error")
+        )
+
+    def get_job_result(self, job_id: str):
+        """Get job result file path"""
+        if job_id not in self.jobs or self.jobs[job_id]["status"] != "completed":
+            return None
+
+        return self.jobs[job_id]["result"]
+
+    def _worker_loop(self):
+        """Background worker thread that processes jobs sequentially"""
+        while self.worker_running:
+            try:
+                # Wait for next job (timeout to allow graceful shutdown)
+                job_id = self.job_queue.get(timeout=1)
+
+                # Process job
+                logger.info(f"Processing job {job_id}")
+                self.jobs[job_id]["status"] = "processing"
+                self.jobs[job_id]["progress"] = "Starting processing"
+
+                try:
+                    self._process_cover_job(job_id)
+                except Exception as e:
+                    self.jobs[job_id]["status"] = "failed"
+                    self.jobs[job_id]["error"] = str(e)
+                    logger.error(f"Job {job_id} failed: {str(e)}")
+
+            except queue.Empty:
+                continue
+            except Exception as e:
+                logger.error(f"Worker error: {str(e)}")
+
+    def _process_cover_job(self, job_id: str):
+        """Process a cover generation job (runs in background thread)"""
+        job = self.jobs[job_id]
+
+        # Save files temporarily
+        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(job["song_filename"])[1]) as song_tmp:
+            song_tmp.write(job["song_content"])
+            song_path = song_tmp.name
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(job["voice_filename"])[1]) as voice_tmp:
+            voice_tmp.write(job["voice_content"])
+            voice_path = voice_tmp.name
+
+        try:
+            # Step 1: Separate vocals
+            job["progress"] = "Separating vocals from instrumentals..."
+            separation_result = self._separate_vocals_sync(song_path)
+
+            # Step 2: Download vocals and apply voice conversion
+            job["progress"] = "Converting vocals to target voice..."
+
+            vocals_file_output = None
+            if isinstance(separation_result, dict):
+                vocals_file_output = separation_result.get("vocals")
+
+            if not vocals_file_output:
+                raise Exception("Could not extract vocals from separation")
+
+            vocals_url = str(vocals_file_output.url) if hasattr(vocals_file_output, 'url') else str(vocals_file_output)
+
+            # Download vocals
+            vocals_response = req.get(vocals_url)
+            content_type = vocals_response.headers.get('content-type', '')
+            suffix = ".mp3" if 'mp3' in content_type or not content_type else (".wav" if 'wav' in content_type else ".mp3")
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as vocals_tmp:
+                vocals_tmp.write(vocals_response.content)
+                vocals_path = vocals_tmp.name
+
+            # Apply voice conversion
+            with open(vocals_path, "rb") as vocals_f, open(voice_path, "rb") as voice_f:
+                output = self.client.run(
+                    self.voice_model,
+                    input={
+                        "source_audio": vocals_f,
+                        "reference_audio": voice_f
+                    }
+                )
+
+            # Clean up temp vocals file immediately after voice conversion
+            try:
+                os.unlink(vocals_path)
+            except:
+                pass
+
+            # Extract converted vocals URL
+            converted_vocals_url = None
+            if isinstance(output, str):
+                converted_vocals_url = output
+            elif hasattr(output, 'url'):
+                converted_vocals_url = str(output.url)
+            elif isinstance(output, dict):
+                if "audio" in output:
+                    converted_vocals_url = output["audio"]
+                elif "url" in output:
+                    converted_vocals_url = output["url"]
+
+            if not converted_vocals_url:
+                raise Exception("Failed to extract converted vocals")
+
+            # Step 3: Mix audio
+            job["progress"] = "Mixing audio tracks..."
+            mixed_audio_path = self._mix_audio_tracks_sync(
+                converted_vocals_url,
+                separation_result["drums"],
+                separation_result["bass"],
+                separation_result["other"]
+            )
+
+            job["result"] = mixed_audio_path
+            job["status"] = "completed"
+            job["progress"] = "Completed"
+            logger.info(f"Job {job_id} completed: {mixed_audio_path}")
+
+        finally:
+            # Clean up temp files
+            for path in [song_path, voice_path]:
+                try:
+                    os.unlink(path)
+                except:
+                    pass
+
+            # Aggressive garbage collection
+            gc.collect()
+
+    def _separate_vocals_sync(self, audio_path: str):
+        """Separate vocals from instrumentals (sync version for worker thread)"""
+        with open(audio_path, "rb") as audio_file:
+            output = self.client.run(
+                app_config.vocal_isolation_model,
+                input={"audio": audio_file}
+            )
+        return output
+
+    def _mix_audio_tracks_sync(self, converted_vocals_url: str, drums_url, bass_url, other_url):
+        """Mix audio tracks (sync version for worker thread)"""
+        # Download all tracks
+        vocals_response = req.get(converted_vocals_url)
+        drums_response = req.get(str(drums_url.url)) if hasattr(drums_url, 'url') else req.get(str(drums_url))
+        bass_response = req.get(str(bass_url.url)) if hasattr(bass_url, 'url') else req.get(str(bass_url))
+        other_response = req.get(str(other_url.url)) if hasattr(other_url, 'url') else req.get(str(other_url))
+
+        # Load audio tracks
+        try:
+            vocals_audio = AudioSegment.from_file(io.BytesIO(vocals_response.content), format="mp3")
+        except:
+            vocals_audio = AudioSegment.from_file(io.BytesIO(vocals_response.content), format="wav")
+
+        try:
+            drums_audio = AudioSegment.from_file(io.BytesIO(drums_response.content), format="mp3")
+        except:
+            drums_audio = AudioSegment.from_file(io.BytesIO(drums_response.content), format="wav")
+
+        try:
+            bass_audio = AudioSegment.from_file(io.BytesIO(bass_response.content), format="mp3")
+        except:
+            bass_audio = AudioSegment.from_file(io.BytesIO(bass_response.content), format="wav")
+
+        try:
+            other_audio = AudioSegment.from_file(io.BytesIO(other_response.content), format="mp3")
+        except:
+            other_audio = AudioSegment.from_file(io.BytesIO(other_response.content), format="wav")
+
+        # Align audio lengths
+        max_length = max(len(vocals_audio), len(drums_audio), len(bass_audio), len(other_audio))
+
+        if len(vocals_audio) < max_length:
+            vocals_audio = vocals_audio + AudioSegment.silent(duration=(max_length - len(vocals_audio)))
+        if len(drums_audio) < max_length:
+            drums_audio = drums_audio + AudioSegment.silent(duration=(max_length - len(drums_audio)))
+        if len(bass_audio) < max_length:
+            bass_audio = bass_audio + AudioSegment.silent(duration=(max_length - len(bass_audio)))
+        if len(other_audio) < max_length:
+            other_audio = other_audio + AudioSegment.silent(duration=(max_length - len(other_audio)))
+
+        # Mix tracks
+        mixed = vocals_audio.overlay(drums_audio).overlay(bass_audio).overlay(other_audio)
+
+        # Clear audio objects from memory
+        del vocals_audio, drums_audio, bass_audio, other_audio
+        gc.collect()
+
+        # Save to temp file
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as mixed_tmp:
+            mixed.export(mixed_tmp.name, format="mp3", bitrate="192k")
+            return mixed_tmp.name
 
     async def generate_song(self, request: GenerateSongRequest):
         """Generate an original song from prompt and optional lyrics using ElevenLabs Music model"""
@@ -85,242 +337,6 @@ class ReplicateService:
                 status_code=400,
                 content={"error": str(e)}
             )
-
-    async def _separate_vocals(self, audio_path: str):
-        """Separate vocals from instrumentals using Demucs"""
-        try:
-            print(f"🎼 Demucs'a gönderiliyor: {audio_path}")
-
-            # Open file and keep it open during the request
-            with open(audio_path, "rb") as audio_file:
-                print(f"📤 Dosya açıldı, Demucs'a gönderiliyor...")
-
-                output = self.client.run(
-                    app_config.vocal_isolation_model,
-                    input={
-                        "audio": audio_file
-                    }
-                )
-
-            print(f"✅ Vocal separation tamamlandı")
-            print(f"📦 Raw output: {output}")
-            return output  # Returns dict with vocals_url, drums_url, bass_url, other_url
-
-        except Exception as e:
-            print(f"❌ Error separating vocals: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            raise
-
-    async def generate_cover(self, song_file, voice_sample):
-        """Generate a cover using voice cloning with realistic-voice-cloning model"""
-
-        # Read file contents
-        song_content = await song_file.read()
-        voice_content = await voice_sample.read()
-
-        logger.info(f"Generating cover: song={song_file.filename}, voice={voice_sample.filename}")
-
-        # Save files temporarily
-        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(song_file.filename)[1]) as song_tmp:
-            song_tmp.write(song_content)
-            song_path = song_tmp.name
-
-        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(voice_sample.filename)[1]) as voice_tmp:
-            voice_tmp.write(voice_content)
-            voice_path = voice_tmp.name
-
-        try:
-            # Step 1: Separate vocals from instrumentals using Demucs
-            print("🎵 Step 1: Separating vocals from instrumentals...")
-            separation_result = await self._separate_vocals(song_path)
-
-            # Debug: Print the actual output structure
-            print(f"📊 Demucs output type: {type(separation_result)}")
-            print(f"📊 Demucs output: {separation_result}")
-
-            # separation_result contains URLs to vocals, drums, bass, other
-            # We'll apply voice conversion only to vocals
-
-            # Step 2: Download separated vocals and apply voice conversion
-            print("🎵 Step 2: Converting vocals to target voice...")
-
-            # Get vocals FileOutput object from separation result
-            vocals_file_output = None
-
-            if isinstance(separation_result, dict):
-                vocals_file_output = separation_result.get("vocals")
-                print(f"📊 Dict keys: {separation_result.keys()}")
-                print(f"📊 Vocals object type: {type(vocals_file_output)}")
-
-            if not vocals_file_output:
-                print(f"⚠️ Could not extract vocals from: {separation_result}")
-                return JSONResponse(
-                    status_code=400,
-                    content={"error": "Could not extract vocals from separation"}
-                )
-
-            # FileOutput object has a .url attribute
-            vocals_url = str(vocals_file_output.url) if hasattr(vocals_file_output, 'url') else str(vocals_file_output)
-            print(f"🔗 Vocals URL: {vocals_url}")
-
-            # Download vocals temporarily
-            import requests as req
-            vocals_response = req.get(vocals_url)
-            # Detect format from content-type or default to mp3
-            content_type = vocals_response.headers.get('content-type', '')
-            suffix = ".mp3" if 'mp3' in content_type or not content_type else (".wav" if 'wav' in content_type else ".mp3")
-            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as vocals_tmp:
-                vocals_tmp.write(vocals_response.content)
-                vocals_path = vocals_tmp.name
-                print(f"💾 Vocals saved to: {vocals_path}")
-
-            # Apply voice conversion to vocals only
-            print("🎤 Applying voice conversion to vocals...")
-
-            # Keep file handles open during the request
-            with open(vocals_path, "rb") as vocals_f, open(voice_path, "rb") as voice_f:
-                print(f"📤 Voice files opened, sending to free-vc...")
-
-                output = self.client.run(
-                    self.voice_model,
-                    input={
-                        "source_audio": vocals_f,
-                        "reference_audio": voice_f
-                    }
-                )
-
-            print(f"✅ Voice conversion completed")
-
-            print("✅ Voice conversion completed, extracting URL...")
-
-            # Handle different output types from Replicate
-            converted_vocals_url = None
-
-            if isinstance(output, str):
-                converted_vocals_url = output
-            elif hasattr(output, 'url'):
-                converted_vocals_url = str(output.url)
-            elif isinstance(output, dict):
-                if "audio" in output:
-                    converted_vocals_url = output["audio"]
-                elif "url" in output:
-                    converted_vocals_url = output["url"]
-
-            if not converted_vocals_url:
-                print(f"⚠️ Could not extract converted vocals URL: {output}")
-                return JSONResponse(
-                    status_code=400,
-                    content={"error": "Failed to extract converted vocals"}
-                )
-
-            print(f"🔗 Converted vocals URL: {converted_vocals_url}")
-
-            # Step 3: Mix converted vocals with instrumentals
-            print("🎼 Step 3: Mixing audio tracks...")
-            mixed_audio_path = await self._mix_audio_tracks(
-                converted_vocals_url,
-                separation_result["drums"],
-                separation_result["bass"],
-                separation_result["other"]
-            )
-
-            # Return the mixed audio (it's already a local file)
-            print(f"📁 Returning mixed audio: {mixed_audio_path}")
-            return FileResponse(
-                path=mixed_audio_path,
-                media_type="audio/mpeg",
-                filename="generated_cover.mp3"
-            )
-
-        except Exception as e:
-            logger.error(f"Error generating cover: {str(e)}")
-            print(f"❌ Error generating cover: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            return JSONResponse(
-                status_code=400,
-                content={"error": str(e)}
-            )
-        finally:
-            # Clean up temporary files
-            try:
-                os.unlink(song_path)
-            except:
-                pass
-            try:
-                os.unlink(voice_path)
-            except:
-                pass
-
-    async def _mix_audio_tracks(self, converted_vocals_url: str, drums_url, bass_url, other_url):
-        """Mix converted vocals with instrumental tracks"""
-        try:
-            print("🎼 Mixing converted vocals with instrumentals...")
-            from pydub import AudioSegment
-            import requests as req
-
-            # Download all tracks
-            print("📥 Downloading tracks...")
-            vocals_response = req.get(converted_vocals_url)
-            drums_response = req.get(str(drums_url.url)) if hasattr(drums_url, 'url') else req.get(str(drums_url))
-            bass_response = req.get(str(bass_url.url)) if hasattr(bass_url, 'url') else req.get(str(bass_url))
-            other_response = req.get(str(other_url.url)) if hasattr(other_url, 'url') else req.get(str(other_url))
-
-            # Load audio tracks
-            print("🔧 Loading audio tracks...")
-            # Try to auto-detect format, fallback to wav if mp3 fails
-            try:
-                vocals_audio = AudioSegment.from_file(io.BytesIO(vocals_response.content), format="mp3")
-            except:
-                vocals_audio = AudioSegment.from_file(io.BytesIO(vocals_response.content), format="wav")
-
-            try:
-                drums_audio = AudioSegment.from_file(io.BytesIO(drums_response.content), format="mp3")
-            except:
-                drums_audio = AudioSegment.from_file(io.BytesIO(drums_response.content), format="wav")
-
-            try:
-                bass_audio = AudioSegment.from_file(io.BytesIO(bass_response.content), format="mp3")
-            except:
-                bass_audio = AudioSegment.from_file(io.BytesIO(bass_response.content), format="wav")
-
-            try:
-                other_audio = AudioSegment.from_file(io.BytesIO(other_response.content), format="mp3")
-            except:
-                other_audio = AudioSegment.from_file(io.BytesIO(other_response.content), format="wav")
-
-            # Make sure all tracks have same length (pad with silence if needed)
-            max_length = max(len(vocals_audio), len(drums_audio), len(bass_audio), len(other_audio))
-
-            if len(vocals_audio) < max_length:
-                silence = AudioSegment.silent(duration=(max_length - len(vocals_audio)))
-                vocals_audio = vocals_audio + silence
-            if len(drums_audio) < max_length:
-                silence = AudioSegment.silent(duration=(max_length - len(drums_audio)))
-                drums_audio = drums_audio + silence
-            if len(bass_audio) < max_length:
-                silence = AudioSegment.silent(duration=(max_length - len(bass_audio)))
-                bass_audio = bass_audio + silence
-            if len(other_audio) < max_length:
-                silence = AudioSegment.silent(duration=(max_length - len(other_audio)))
-                other_audio = other_audio + silence
-
-            # Mix all tracks
-            print("🎵 Mixing tracks...")
-            mixed = vocals_audio.overlay(drums_audio).overlay(bass_audio).overlay(other_audio)
-
-            # Save mixed audio to temporary file
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as mixed_tmp:
-                mixed.export(mixed_tmp.name, format="mp3", bitrate="192k")
-                print(f"✅ Mixing completed: {mixed_tmp.name}")
-                return mixed_tmp.name
-
-        except Exception as e:
-            print(f"❌ Error mixing audio: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            raise
 
     async def get_billing(self) -> BillingResponse:
         """Get account information (Replicate doesn't have a billing API, return placeholder)"""

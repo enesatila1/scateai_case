@@ -43,3 +43,16 @@ class BillingResponse(BaseModel):
     status: str
     data: Optional[dict] = None
     error: Optional[str] = None
+
+
+# Job Queue Models
+class JobStatusResponse(BaseModel):
+    job_id: str
+    status: str  # pending, processing, completed, failed
+    progress: Optional[str] = None
+    error: Optional[str] = None
+
+
+class CoverGenerationRequest(BaseModel):
+    song_file: Optional[str] = None
+    voice_sample: Optional[str] = None
