@@ -42,7 +42,7 @@ if __name__ == "__main__":
     print("=" * 50)
 
     uvicorn.run(
-        "app:app",  # ---! Import string olarak geçir - reload için gerekli
+        "src.app:app",
         host="0.0.0.0",
         port=app_config.port,
         log_level="info",

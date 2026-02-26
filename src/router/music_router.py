@@ -1,12 +1,14 @@
 import logging
 from fastapi import APIRouter, File, UploadFile, HTTPException
 from fastapi.responses import FileResponse
-from ..config import GenerateSongRequest, GenerateSongResponse, GenerateCoverResponse, BillingResponse, JobStatusResponse
-from ..services.mureka_service import ReplicateService
+from ..config import GenerateSongRequest, BillingResponse, JobStatusResponse
+from ..services.generation_service import GenerationService
+from ..services.vocal_service import VocalService
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/music", tags=["MUSIC"])
-service = ReplicateService()
+generation_service = GenerationService()
+vocal_service = VocalService()
 
 
 @router.post("/generate-song")
@@ -15,7 +17,7 @@ async def generate_song(request: GenerateSongRequest):
 
     Returns: Audio file (MP3)
     """
-    return await service.generate_song(request)
+    return await generation_service.generate_song(request)
 
 
 @router.post("/generate-cover")
@@ -27,14 +29,16 @@ async def generate_cover(
 
     Returns: {job_id: str}
     """
-    job_id = await service.submit_cover_job(song_file, voice_sample)
+    job_id = await vocal_service.submit_cover_job(song_file, voice_sample)
+    if isinstance(job_id, tuple):
+        raise HTTPException(status_code=job_id[1], detail=job_id[0].get("error"))
     return {"job_id": job_id, "status": "pending"}
 
 
 @router.get("/status/{job_id}", response_model=JobStatusResponse)
 async def get_job_status(job_id: str):
     """Get the status of a cover generation job"""
-    status = service.get_job_status(job_id)
+    status = vocal_service.get_job_status(job_id)
     if not status:
         raise HTTPException(status_code=404, detail="Job not found")
     return status
@@ -43,7 +47,7 @@ async def get_job_status(job_id: str):
 @router.get("/result/{job_id}")
 async def get_job_result(job_id: str):
     """Get the result of a completed cover generation job"""
-    result = service.get_job_result(job_id)
+    result = vocal_service.get_job_result(job_id)
     if not result:
         raise HTTPException(status_code=404, detail="Job not found or not completed")
     return FileResponse(
@@ -56,4 +60,4 @@ async def get_job_result(job_id: str):
 @router.get("/billing", response_model=BillingResponse)
 async def get_billing():
     """Get account billing info and quota usage"""
-    return await service.get_billing()
+    return await generation_service.get_billing()
